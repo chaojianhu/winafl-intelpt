@@ -34,6 +34,7 @@ wchar_t* charToWChar(const char* text)
     return wa;
 }
 
+__declspec(dllexport)
 int main(int argc, char** argv)
 {
 	if(argc < 2) {

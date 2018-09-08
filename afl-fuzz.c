@@ -64,11 +64,364 @@
 
 // IntelPT includes
 #define INTELPT
+#define PROCESS_DEBUG
+
 #ifdef INTELPT
 #define MEM_LIMIT_INTELPT   200
-#include "../ptcov/ptcov.h"
-#pragma comment (lib, "ptcov.lib")
-PtCovCtx ptcov = NULL;
+//#include "../ptcov/ptcov.h"
+//#pragma comment (lib, "ptcov.lib")
+//#include "../winipt/inc/libipt.h"
+#include "libipt.h"
+//#pragma comment (lib, "..\\winipt\\x64\\Release\\libipt.lib")
+//PtCovCtx ptcov = NULL;
+
+#define IPT_TOOL_USE_MTC_TIMING_PACKETS     0x01
+#define IPT_TOOL_USE_CYC_TIMING_PACKETS     0x02
+#define IPT_TOOL_TRACE_KERNEL_MODE          0x04
+#define IPT_TOOL_TRACE_ALL_MODE             0x08
+
+#define IPT_TOOL_VALID_FLAGS                \
+    (IPT_TOOL_USE_MTC_TIMING_PACKETS |      \
+     IPT_TOOL_USE_CYC_TIMING_PACKETS |      \
+     IPT_TOOL_TRACE_KERNEL_MODE |           \
+     IPT_TOOL_TRACE_ALL_MODE)
+
+typedef enum _IPT_TL_ACTION
+{
+	IptTlStartTrace,
+	IptTlStopTrace,
+	IptTlGetTrace
+} IPT_TL_ACTION;
+
+FORCEINLINE
+DWORD
+ConvertToPASizeToSizeOption(
+	_In_ DWORD dwSize
+)
+{
+	DWORD dwIndex;
+
+	//
+	// Cap the size to 128MB. Sizes below 4KB will result in 0 anyway.
+	//
+	if (dwSize > (128 * 1024 * 1024))
+	{
+		dwSize = 128 * 1024 * 1024;
+	}
+
+	//
+	// Find the nearest power of two that's set (align down)
+	//
+	BitScanReverse(&dwIndex, dwSize);
+
+	//
+	// The value starts at 4KB
+	//
+	dwIndex -= 12;
+	return dwIndex;
+}
+
+BOOL
+EnableIpt(
+	VOID
+)
+{
+	SC_HANDLE hScm, hSc;
+	BOOL bRes;
+	bRes = FALSE;
+
+	//
+	// Open a handle to the SCM
+	//
+	hScm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+	if (hScm != NULL)
+	{
+		//
+		// Open a handle to the IPT Service
+		//
+		hSc = OpenService(hScm, "Ipt", SERVICE_START);
+		if (hSc != NULL)
+		{
+			//
+			// Start it
+			//
+			bRes = StartService(hSc, 0, NULL);
+			if ((bRes == FALSE) &&
+				(GetLastError() == ERROR_SERVICE_ALREADY_RUNNING))
+			{
+				//
+				// If it's already started, that's OK
+				//
+				bRes = TRUE;
+			}
+			else if (bRes == FALSE)
+			{
+				wprintf(L"[-] Unable to start IPT Service (err=%d)\n",
+					GetLastError());
+				if (GetLastError() == ERROR_NOT_SUPPORTED)
+				{
+					wprintf(L"[-] This is likely due to missing PT support\n");
+				}
+			}
+
+			//
+			// Done with the service
+			//
+			CloseServiceHandle(hSc);
+		}
+		else
+		{
+			wprintf(L"[-] Unable to open IPT Service (err=%d). "
+				L"Are you running Windows 10 1809?\n",
+				GetLastError());
+		}
+
+		//
+		// Done with the SCM
+		//
+		CloseServiceHandle(hScm);
+	}
+	else
+	{
+		wprintf(L"[-] Unable to open a handle to the SCM (err=%d)\n",
+			GetLastError());
+	}
+
+	//
+	// Return the result
+	//
+	return bRes;
+}
+
+BOOL
+EnableAndValidateIptServices(
+	VOID
+)
+{
+	WORD wTraceVersion;
+	DWORD dwBufferVersion;
+	BOOL bRes;
+
+	//
+	// First enable IPT
+	//
+	bRes = EnableIpt();
+	if (bRes == FALSE)
+	{
+		wprintf(L"[-] Intel PT Service could not be started!\n");
+		goto Cleanup;
+	}
+
+	//
+	// Next, check if the driver uses a dialect we understand
+	//
+	bRes = GetIptBufferVersion(&dwBufferVersion);
+	if (bRes == FALSE)
+	{
+		wprintf(L"[-] Failed to communicate with IPT Service: (err=%d)\n",
+			GetLastError());
+		goto Cleanup;
+	}
+	if (dwBufferVersion != IPT_BUFFER_MAJOR_VERSION_CURRENT)
+	{
+		wprintf(L"[-] IPT Service buffer version is not supported: %d\n",
+			dwBufferVersion);
+		goto Cleanup;
+	}
+
+	//
+	// Then, check if the driver uses trace versions we speak
+	//
+	bRes = GetIptTraceVersion(&wTraceVersion);
+	if (bRes == FALSE)
+	{
+		wprintf(L"[-] Failed to get Trace Version from IPT Service (err=%d)\n",
+			GetLastError());
+		goto Cleanup;
+	}
+	if (wTraceVersion != IPT_TRACE_VERSION_CURRENT)
+	{
+		wprintf(L"[-] IPT Service trace version is not supported %d\n",
+			wTraceVersion);
+		goto Cleanup;
+	}
+
+Cleanup:
+	//
+	// Return result
+	//
+	return bRes;
+}
+
+
+BOOL
+ConfigureTraceFlags(
+	_In_ PWCHAR pwszFlags,
+	_Inout_ PIPT_OPTIONS pOptions
+)
+{
+	DWORD dwFlags;
+	BOOL bRes;
+	bRes = FALSE;
+
+	//
+	// Read the flags now and make sure they're valid
+	//
+	dwFlags = wcstoul(pwszFlags, NULL, 16);
+	if (dwFlags & ~IPT_TOOL_VALID_FLAGS)
+	{
+		wprintf(L"[-] Invalid flags: %s\n", pwszFlags);
+		goto Cleanup;
+	}
+
+	//
+	// If the user didn't specify MTC, but wants CYC, set MTC too as the IPT
+	// driver wil enable those packets anyway.
+	//
+	if ((dwFlags & IPT_TOOL_USE_CYC_TIMING_PACKETS) &&
+		!(dwFlags & IPT_TOOL_USE_MTC_TIMING_PACKETS))
+	{
+		wprintf(L"[*] CYC Packets require MTC packets, adjusting flags!\n");
+		dwFlags |= IPT_TOOL_USE_MTC_TIMING_PACKETS;
+	}
+
+	//
+	// If the user didn't specify MTC, but wants CYC, set MTC too as the IPT
+	// driver wil enable those packets anyway.
+	//
+	if ((dwFlags & (IPT_TOOL_TRACE_KERNEL_MODE | IPT_TOOL_TRACE_ALL_MODE)) ==
+		(IPT_TOOL_TRACE_KERNEL_MODE | IPT_TOOL_TRACE_ALL_MODE))
+	{
+		wprintf(L"[-] Cannot enable both `kernel` and `user + kernel` tracing."
+			L" Please pick a single flag to use!\n");
+		goto Cleanup;
+	}
+
+	//
+	// There are no matching options for process tradces
+	//
+	pOptions->MatchSettings = IptMatchByAnyApp;
+
+	//
+	// Choose the right timing setting
+	//
+	if (dwFlags & IPT_TOOL_USE_MTC_TIMING_PACKETS)
+	{
+		pOptions->TimingSettings = IptEnableMtcPackets;
+		pOptions->MtcFrequency = 3; // FIXME
+	}
+	else if (dwFlags & IPT_TOOL_USE_CYC_TIMING_PACKETS)
+	{
+		pOptions->TimingSettings = IptEnableCycPackets;
+		pOptions->CycThreshold = 1; // FIXME
+	}
+	else
+	{
+		pOptions->TimingSettings = IptNoTimingPackets;
+	}
+
+	//
+	// Choose the right mode setting
+	//
+	if (dwFlags & IPT_TOOL_TRACE_KERNEL_MODE)
+	{
+		pOptions->ModeSettings = IptCtlKernelModeOnly;
+	}
+	else if (dwFlags & IPT_TOOL_TRACE_ALL_MODE)
+	{
+		pOptions->ModeSettings = IptCtlUserAndKernelMode;
+	}
+	else
+	{
+		pOptions->ModeSettings = IptCtlUserModeOnly;
+	}
+
+	//
+	// Print out chosen options
+	//
+	bRes = TRUE;
+	wprintf(L"[+] Tracing Options:\n"
+		L"           Match by: %s\n"
+		L"         Trace mode: %s\n"
+		L"     Timing packets: %s\n",
+		L"Any process",
+		(pOptions->ModeSettings == IptCtlUserAndKernelMode) ?
+		L"Kernel and user-mode" :
+		(pOptions->ModeSettings == IptCtlKernelModeOnly) ?
+		L"Kernel-mode only" : L"User-mode only",
+		(pOptions->TimingSettings == IptEnableMtcPackets) ?
+		L"MTC Packets" :
+		(pOptions->TimingSettings == IptEnableCycPackets) ?
+		L"CYC Packets" : L"No  Packets");
+
+Cleanup:
+	//
+	// Return result
+	//
+	return bRes;
+}
+
+BOOL
+ConfigureBufferSize(
+	_In_ PWCHAR pwszSize,
+	_Inout_ PIPT_OPTIONS pOptions
+)
+{
+	DWORD dwSize;
+	BOOL bRes;
+	bRes = FALSE;
+
+	//
+	// Get the buffer size
+	//
+	dwSize = wcstoul(pwszSize, NULL, 10);
+	if (dwSize == 0)
+	{
+		wprintf(L"[-] Invalid size: %s\n", pwszSize);
+		goto Cleanup;
+	}
+
+	//
+	// Warn the user about incorrect values
+	//
+	if (!((dwSize) && ((dwSize & (~dwSize + 1)) == dwSize)))
+	{
+		wprintf(L"[*] Size will be aligned to a power of 2\n");
+	}
+	else if (dwSize < 4096)
+	{
+		wprintf(L"[*] Size will be set to minimum of 4KB\n");
+	}
+	else if (dwSize >(128 * 1024 * 1024))
+	{
+		wprintf(L"[*] Size will be set to a maximum of 128MB\n");
+	}
+
+	//
+	// Compute the size option
+	//
+	pOptions->TopaPagesPow2 = ConvertToPASizeToSizeOption(dwSize);
+	bRes = TRUE;
+	wprintf(L"[+] Using size: %d bytes\n",
+		1 << (pOptions->TopaPagesPow2 + 12));
+
+Cleanup:
+	//
+	// Return result
+	//
+	return bRes;
+}
+
+
+DWORD dwTraceSize;
+HANDLE hProcess;
+HANDLE hTraceFile;
+DWORD dwResult;
+IPT_TL_ACTION dwAction;
+IPT_OPTIONS options;
+PIPT_TRACE_DATA pTraceData;
+PIPT_TRACE_HEADER traceHeader;
+DWORD dwEntries;
 #endif
 
 /* Lots of globals, but mostly for the status UI and other things where it
@@ -2342,10 +2695,10 @@ static void create_target_process_intelpt(char** argv) {
   size_t pidsize;
   BOOL inherit_handles = TRUE;
 
-  STARTUPINFO si;
-  PROCESS_INFORMATION pi;
+  STARTUPINFO si = { 0 };
+  PROCESS_INFORMATION pi = { 0 };
 
-  printf("create_target_process_intelpt\n");
+  //printf("create_target_process_intelpt\n");
 
   if (persistent_mode)
   {
@@ -2370,13 +2723,15 @@ static void create_target_process_intelpt(char** argv) {
     SetEnvironmentVariableA("AFL_PIPE_NAME", pipe_name);
     ck_free(pipe_name);
   }
+
+
   target_cmd = argv_to_cmd(argv);
 
-  ZeroMemory(&si, sizeof(si));
+  //ZeroMemory(&si, sizeof(si));
   si.cb = sizeof(si);
-  ZeroMemory(&pi, sizeof(pi));
+  //ZeroMemory(&pi, sizeof(pi));
 
-  sinkhole_stds = 0;
+  sinkhole_stds = 1;
   if (sinkhole_stds) {
     si.hStdOutput = si.hStdError = devnul_handle;
     si.dwFlags |= STARTF_USESTDHANDLES;
@@ -2385,8 +2740,12 @@ static void create_target_process_intelpt(char** argv) {
     inherit_handles = FALSE;
   }
 
-  if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
-    FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
+#ifdef PROCESS_DEBUG
+  if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW | DEBUG_ONLY_THIS_PROCESS, NULL, NULL, &si, &pi)) {
+#else
+  if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+#endif
+		  FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
   }
   child_handle = pi.hProcess;
   child_thread_handle = pi.hThread;
@@ -2574,7 +2933,7 @@ static void destroy_target_process_intelpt(int wait_exit) {
 }
 #endif
 
-DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
+DWORD WINAPI watchdog_timer( LPVOID lpParam ) {	
 	u64 current_time;
 	while(1) {
 		Sleep(1000);
@@ -2611,22 +2970,6 @@ static int is_child_running() {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 #ifdef INTELPT
-static u8 run_target(char** argv, u32 timeout) {
-  if (intelpt_mode)
-  {
-    if(persistent_mode)
-      return run_target_intelpt_persistent(argv);
-    else if (kernel_mode)
-      return run_target_intelpt_kernel(argv);
-    else
-      return run_target_intelpt(argv);
-  }
-  else
-  {
-    return run_target_dynamo(argv, timeout);
-  }
-}
-
 static u8 run_target_dynamo(char** argv, u32 timeout) {
 #else
 static u8 run_target(char** argv, u32 timeout) {
@@ -2752,7 +3095,8 @@ static u8 run_target_intelpt_persistent(char** argv) {
   child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
 
-  PtTraceProcessStart(child_handle);
+  //FIXME
+  //PtTraceProcessStart(child_handle);
 
   WriteFile(
     pipe_handle,    // handle to pipe
@@ -2767,8 +3111,8 @@ static u8 run_target_intelpt_persistent(char** argv) {
   ReadFile(pipe_handle, &result, 1, &num_read, NULL);
 
   watchdog_enabled = 0;
-
-  PtTraceProcessStop(child_handle);
+  //FIXME
+  //PtTraceProcessStop(child_handle);
   //process_pt_ext();
 
   total_execs++;
@@ -2794,20 +3138,71 @@ static u8 run_target_intelpt_persistent(char** argv) {
 }
 
 static u8 run_target_intelpt(char** argv) {
-  char *cmdLine = argv_to_cmd(argv);
-  unsigned int cmdLen = (strlen(cmdLine) + 1) * sizeof(wchar_t);
-  wchar_t *cmdLineW = malloc(cmdLen);
-  mbstowcs(cmdLineW, cmdLine, cmdLen);
+  int ret = FAULT_NONE;
+  //printf("run_target_intelpt\n");
+#if 0
+  sinkhole_stds = 0;
+  if (sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
+	  devnul_handle = CreateFile(
+		  "nul",
+		  GENERIC_READ | GENERIC_WRITE,
+		  FILE_SHARE_READ | FILE_SHARE_WRITE,
+		  NULL,
+		  OPEN_EXISTING,
+		  0,
+		  NULL);
 
-  printf("run_target_intelpt\n");
-
+	  if (devnul_handle == INVALID_HANDLE_VALUE) {
+		  PFATAL("Unable to open the nul device.");
+	  }
+  }
+#endif
+  //if (!is_child_running()) {
+	  //destroy_target_process_intelpt(0);
+	  create_target_process_intelpt(argv);
+  //}
+  child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
-  PtTraceCmdLine(cmdLineW);
-  ptcov_get_afl_map(ptcov, trace_bits);
+  //watchdog_timeout_time = get_cur_time() + exec_tmout;
+  //watchdog_enabled = 1;
+
+#ifdef PROCESS_DEBUG
+  DEBUG_EVENT event;
+  BOOL debugging = TRUE;
+  while (debugging)
+  {	  
+	  if (!WaitForDebugEvent(&event, INFINITE))
+		  break;
+  
+	  switch (event.dwDebugEventCode)
+	  {
+	  case EXCEPTION_DEBUG_EVENT:
+		  if (event.u.Exception.dwFirstChance) break;
+		  ret = FAULT_CRASH;
+		  debugging = FALSE;
+		  break;
+	  case EXIT_PROCESS_DEBUG_EVENT:
+		  ret = FAULT_NONE;
+		  debugging = FALSE;
+		  if(event.u.ExitProcess.dwExitCode != 0) printf("Process exited with code : 0x%x", event.u.ExitProcess.dwExitCode);
+		  break;
+	  }
+	  ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+  }
+#else
+  DWORD exitCode = 0;
+  ResumeThread(child_thread_handle);
+  WaitForSingleObject(child_handle, INFINITE);
+  GetExitCodeProcess(child_handle, &exitCode);
+#endif
+
+  CloseHandle(child_thread_handle);
+  CloseHandle(child_handle);
+
   total_execs++;
 
-  free(cmdLineW);
-  return FAULT_NONE;
+  //  ret = FAULT_TMOUT;
+  return ret;
 }
 
 static u8 run_target_intelpt_kernel(char** argv) {
@@ -2819,11 +3214,27 @@ static u8 run_target_intelpt_kernel(char** argv) {
   fprintf(stderr, "run_target_intelpt_kernel\n");
 
   memset(trace_bits, 0, MAP_SIZE);
-  PtTraceCmdLineKernel(cmdLineW);
-  ptcov_get_afl_map(ptcov, trace_bits);
+  //PtTraceCmdLineKernel(cmdLineW);
+  //ptcov_get_afl_map(ptcov, trace_bits);
   total_execs++;
   free(cmdLineW);
   return FAULT_NONE;
+}
+
+static u8 run_target(char** argv, u32 timeout) {
+	if (intelpt_mode)
+	{
+		if (persistent_mode)
+			return run_target_intelpt_persistent(argv);
+		else if (kernel_mode)
+			return run_target_intelpt_kernel(argv);
+		else
+			return run_target_intelpt(argv);
+	}
+	else
+	{
+		return run_target_dynamo(argv, timeout);
+	}
 }
 #endif
 
@@ -7190,40 +7601,69 @@ static void check_term_size(void) {
 
 static void usage(u8* argv0) {
 
-  SAYF("\n%s [ afl options ] -- [instrumentation options] -- "
-	   "\\path\\to\\fuzzed_app [ ... ]\n\n"
-
-       "Required parameters:\n\n"
-
-       "  -i dir        - input directory with test cases\n"
-       "  -o dir        - output directory for fuzzer findings\n"
-       "  -t msec       - timeout for each run\n\n"
 #ifdef INTELPT
-       "  -P            - trace with intelpt\n"
-       "  -PP           - persistent trace with intelpt\n"
+	SAYF("\n%s [ afl options ] -- [instrumentation options] -- "
+		"\\path\\to\\fuzzed_app [ ... ]\n\n"
+
+		"Required parameters:\n\n"
+
+		"  -i dir        - input directory with test cases\n"
+		"  -o dir        - output directory for fuzzer findings\n"
+		"  -t msec       - timeout for each run\n\n"
+		"  -P            - trace with intelpt\n"
+		"  -PP           - persistent trace with intelpt\n"
+		"Instrumentation type:\n\n"
+		"  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
+		"  -Y            - enable the static instrumentation mode\n\n"
+
+		"Execution control settings:\n\n"
+
+		"  -f file       - location read by the fuzzed program (stdin)\n"
+
+		"Fuzzing behavior settings:\n\n"
+
+		"  -d            - quick & dirty mode (skips deterministic steps)\n"
+		"  -x dir        - optional fuzzer dictionary (see README)\n\n"
+
+		"Other stuff:\n\n"
+
+		"  -T text       - text banner to show on the screen\n"
+		"  -M \\ -S id    - distributed mode (see parallel_fuzzing.txt)\n"
+
+		"For additional tips, please consult %s\\README.\n\n",
+
+		argv0, doc_path);
+#else
+	SAYF("\n%s [ afl options ] -- [instrumentation options] -- "
+		"\\path\\to\\fuzzed_app [ ... ]\n\n"
+
+		"Required parameters:\n\n"
+
+		"  -i dir        - input directory with test cases\n"
+		"  -o dir        - output directory for fuzzer findings\n"
+		"  -t msec       - timeout for each run\n\n"
+		"Instrumentation type:\n\n"
+		"  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
+		"  -Y            - enable the static instrumentation mode\n\n"
+
+		"Execution control settings:\n\n"
+
+		"  -f file       - location read by the fuzzed program (stdin)\n"
+
+		"Fuzzing behavior settings:\n\n"
+
+		"  -d            - quick & dirty mode (skips deterministic steps)\n"
+		"  -x dir        - optional fuzzer dictionary (see README)\n\n"
+
+		"Other stuff:\n\n"
+
+		"  -T text       - text banner to show on the screen\n"
+		"  -M \\ -S id    - distributed mode (see parallel_fuzzing.txt)\n"
+
+		"For additional tips, please consult %s\\README.\n\n",
+
+		argv0, doc_path);
 #endif
-
-       "Instrumentation type:\n\n"
-        "  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
-        "  -Y            - enable the static instrumentation mode\n\n"
-
-       "Execution control settings:\n\n"
-
-       "  -f file       - location read by the fuzzed program (stdin)\n"
- 
-       "Fuzzing behavior settings:\n\n"
-
-       "  -d            - quick & dirty mode (skips deterministic steps)\n"
-       "  -x dir        - optional fuzzer dictionary (see README)\n\n"
-
-       "Other stuff:\n\n"
-
-       "  -T text       - text banner to show on the screen\n"
-       "  -M \\ -S id    - distributed mode (see parallel_fuzzing.txt)\n"
-
-       "For additional tips, please consult %s\\README.\n\n",
-
-       argv0, doc_path);
 
   exit(1);
 
@@ -8090,13 +8530,87 @@ int main(int argc, char** argv) {
   }
 
 #ifdef INTELPT
+  /*
   if (intelpt_mode == 3)
   {
     if (!InitPtTrace(&trace_bits))
       FATAL("ERROR: could not initialize ptcov library\n");
   }
-  else if (intelpt_mode > 0)
+  else*/ 
+  if (intelpt_mode > 0)
   {
+	// FIXME winipt
+
+	//
+	// Setup cleanup path
+	//
+	  hTraceFile = INVALID_HANDLE_VALUE;
+	  hProcess = NULL;
+	  pTraceData = NULL;
+	  dwResult = 0xFFFFFFFF;
+	  options.AsULonglong = 0;
+
+	  //
+	  // Initialize options for Intel PT Trace
+	  //
+	  options.OptionVersion = 1;
+	  //
+	  // Configure the buffer size
+	  //
+	  BOOL bRes = ConfigureBufferSize(L"65536", &options);
+	  if (bRes == FALSE)
+	  {
+		  goto intelpt_cleanup;
+	  }
+
+	  //
+	  // Configure the trace flag
+	  //
+	  bRes = ConfigureTraceFlags("0", &options);
+	  if (bRes == FALSE)
+	  {
+		  goto intelpt_cleanup;
+	  }
+
+	  dwAction = IptTlStopTrace;
+	  printf("test\n");
+	  //
+	  // Enable and validate IPT support works
+	  //
+	  bRes = EnableAndValidateIptServices();
+	  if (bRes == FALSE)
+	  {
+		  goto intelpt_cleanup;
+	  }
+
+  intelpt_cleanup:
+	  if (bRes == FALSE)
+	  {
+		  if (pTraceData != NULL)
+		  {
+			  HeapFree(GetProcessHeap(), 0, pTraceData);
+		  }
+
+		  //
+		  // Close the trace file if we had one
+		  //
+		  if (hTraceFile != INVALID_HANDLE_VALUE)
+		  {
+			  CloseHandle(hTraceFile);
+		  }
+
+		  //
+		  // Close the process handle if we had one
+		  //
+		  if (hProcess != NULL)
+		  {
+			  CloseHandle(hProcess);
+		  }
+
+		  FATAL("Error initializing Intel PT\n");
+	  }
+	  
+	  /*
     if (!ptcov_init())
       FATAL("ERROR: could not initialize ptcov library (check driver install)\n");
 
@@ -8111,6 +8625,7 @@ int main(int argc, char** argv) {
 
     if (!ptcov_init_trace(&ptcov_options, &ptcov))
       FATAL("ERROR: could not initialize ptcov trace\n");
+	*/
   }
 #endif
 
