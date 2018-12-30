@@ -1,6 +1,54 @@
 =========
 ChangeLog
 =========
+
+----------------------------------
+Version 1.15 (based on afl 2.43b):
+----------------------------------
+
+  - Added -p flag which persists DynamoRIO cache across process restarts.
+    This might have a slight positive impact on performance in some scenarios,
+    such as where WinAFL persistece can't be used effectively, or
+    with very complex targets.
+
+  - Fix custom_net_fuzzer to avoid consuming system resources by
+    unclosed sockets.
+    Contributed by MostafaSoliman
+
+----------------------------------
+Version 1.14 (based on afl 2.43b):
+----------------------------------
+  
+  - Added support for third-party DLLs for custom test cases processing
+    This currently comes with (experimental) network fuzzing implementation
+    (both server- and client- side)
+    Contributed by Maksim Shudrak
+
+  - New "In App Persistence" mode that relaxes target_method restrictions
+    if the target process can be made to loop on its own
+    Contributed by Guy Inbar
+    
+  - Implemented setup_post on Windows
+    Contributed by Quang Nguyễn
+
+  - Added separate timeout for process initialization and the first run
+    Contributed by Netanel Ben Simon
+
+  - Added color support to afl-showmap & afl-tmin
+    Contributed by Yoav Alon
+
+  - added winafl-plot.py a winafl replacement for afl-plot
+    Contributed by Yoav Alon
+
+  - added winafl-whatsup.py a winafl replacement for afl-whatsup
+    Contributed by Yoav Alon
+
+  - Fixed compilation issue on newer versions of DynamoRIO
+    Contributed by Yoav Alon
+    
+  - Other minor fixes and improvements
+    Contributed by L4ys, Yoav Alon, Netanel Ben Simon and others
+
 ----------------------------------
 Version 1.13 (based on afl 2.43b):
 ----------------------------------
