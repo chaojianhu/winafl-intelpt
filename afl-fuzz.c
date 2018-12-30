@@ -29,6 +29,8 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
+#define WIN32_LEAN_AND_MEAN /* prevent winsock.h to be included in windows.h */
+
 #define _CRT_RAND_S
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -38,7 +40,7 @@
 #include <direct.h>
 
 #define VERSION "2.43b"
-#define WINAFL_VERSION "1.13"
+#define WINAFL_VERSION "1.15"
 
 #include "config.h"
 #include "types.h"
@@ -86,7 +88,9 @@ static u8 *in_dir,                    /* Input directory with test cases  */
           *target_cmd,                /* command line of target           */
           *orig_cmdline;              /* Original command line            */
 
+
 static u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
+static u32 init_tmout = 0;            /* Configurable init timeout (ms)   */
 static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
 
 static u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
@@ -121,6 +125,8 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            kernel_mode;               /* Tracing kernel mode?             */
 #endif
            drioless = 0;              /* Running without DRIO?            */
+           custom_dll_defined = 0;    /* Custom DLL path defined ?        */
+           persist_dr_cache = 0;    /* Custom DLL path defined ?        */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -150,6 +156,8 @@ static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
 static HANDLE pipe_handle;            /* Handle of the name pipe          */
+static OVERLAPPED pipe_overlapped;    /* Overlapped structure of pipe     */
+
 static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized 
                                          seed allowing multiple instances */
 static HANDLE devnul_handle;          /* Handle of the nul device         */
@@ -327,6 +335,7 @@ enum {
   /* 04 */ FAULT_NOINST,
   /* 05 */ FAULT_NOBITS
 };
+
 
 
 /* Get unix time in milliseconds */
@@ -1457,10 +1466,29 @@ static void setup_shm(void) {
 
 }
 
+char* dlerror(){
+    static char msg[1024] = {0};
+    DWORD errCode = GetLastError();
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, errCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR) msg, sizeof(msg)/sizeof(msg[0]), NULL);
+    return msg;
+}
 /* Load postprocessor, if available. */
 
 static void setup_post(void) {
-  //not implemented on Windows
+    HMODULE dh;
+    u8* fn = getenv("AFL_POST_LIBRARY");
+    u32 tlen = 6;
+
+    if (!fn) return;
+    ACTF("Loading postprocessor from '%s'...", fn);
+    dh = LoadLibraryA(fn);
+    if (!dh) FATAL("%s", dlerror());
+    post_handler = (u8* (*)(u8*,u32*))GetProcAddress(dh, "afl_postprocess");
+    if (!post_handler) FATAL("Symbol 'afl_postprocess' not found.");
+
+    /* Do a quick test. It's better to segfault now than later =) */
+    post_handler("hello", &tlen);
+    OKF("Postprocessor installed successfully.");
 }
 
 int compare_filename(const void *a, const void *b) {
@@ -2187,6 +2215,42 @@ char *argv_to_cmd(char** argv) {
   return ret;
 }
 
+/*Initialazing overlapped structure and connecting*/
+static BOOL OverlappedConnectNamedPipe(HANDLE pipe_h, LPOVERLAPPED overlapped)
+{
+	ZeroMemory(overlapped, sizeof(*overlapped));
+	
+	overlapped->hEvent = CreateEvent(
+		NULL,    // default security attribute 
+		TRUE,    // manual-reset event 
+		TRUE,    // initial state = signaled 
+		NULL);   // unnamed event object 
+
+	if (overlapped->hEvent == NULL)
+	{
+		return FALSE;
+	}
+
+	if (ConnectNamedPipe(pipe_h, overlapped))
+	{
+		return FALSE;
+	}
+	switch (GetLastError())
+	{
+		// The overlapped connection in progress. 
+	case ERROR_IO_PENDING:
+		WaitForSingleObject(overlapped->hEvent, INFINITE);
+		return TRUE;
+		// Client is already connected
+	case ERROR_PIPE_CONNECTED:
+		return TRUE;
+	default:
+	{
+		return FALSE;
+	}
+	}
+}
+
 #ifdef INTELPT
 static void create_target_process_dynamo(char** argv) {
 #else
@@ -2209,7 +2273,8 @@ static void create_target_process(char** argv) {
 
   pipe_handle = CreateNamedPipe(
     pipe_name,                // pipe name
-    PIPE_ACCESS_DUPLEX,       // read/write access
+	PIPE_ACCESS_DUPLEX |     // read/write access 
+	FILE_FLAG_OVERLAPPED,    // overlapped mode 
     0,
     1,                        // max. instances
     512,                      // output buffer size
@@ -2246,12 +2311,16 @@ static void create_target_process(char** argv) {
     ck_free(static_config);
   } else {
     pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
-    cmd = alloc_printf(
-      "%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
-      dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
-    );
+	if (persist_dr_cache) {
+		cmd = alloc_printf(
+			"%s\\drrun.exe -pidfile %s -no_follow_children -persist -persist_dir \"%s\\drcache\" -c winafl.dll %s -fuzzer_id %s -drpersist -- %s",
+			dynamorio_dir, pidfile, out_dir, client_params, fuzzer_id, target_cmd);
+	} else {
+		cmd = alloc_printf(
+			"%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
+			dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd);
+	}
   }
-
   if(mem_limit || cpu_aff) {
     hJob = CreateJobObject(NULL, NULL);
     if(hJob == NULL) {
@@ -2297,10 +2366,8 @@ static void create_target_process(char** argv) {
   watchdog_timeout_time = get_cur_time() + exec_tmout;
   watchdog_enabled = 1;
 
-  if(!ConnectNamedPipe(pipe_handle, NULL)) {
-    if(GetLastError() != ERROR_PIPE_CONNECTED) {
+  if(!OverlappedConnectNamedPipe(pipe_handle, &pipe_overlapped)) {
       FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
-    }
   }
 
   watchdog_enabled = 0;
@@ -2484,6 +2551,7 @@ leave:
 	if (pipe_handle) {
 		DisconnectNamedPipe(pipe_handle);
 		CloseHandle(pipe_handle);
+		CloseHandle(pipe_overlapped.hEvent);
 
 		pipe_handle = NULL;
 	}
@@ -2592,6 +2660,37 @@ DWORD WINAPI watchdog_timer( LPVOID lpParam ) {
 	}
 }
 
+char ReadCommandFromPipe(u32 timeout)
+{
+	DWORD num_read;
+	char result = 0;
+	if (!is_child_running())
+	{
+		return 0;
+	}
+
+	if (ReadFile(pipe_handle, &result, 1, &num_read, &pipe_overlapped) || GetLastError() == ERROR_IO_PENDING)
+	{
+		//ACTF("ReadFile success or GLE IO_PENDING", result);
+		if (WaitForSingleObject(pipe_overlapped.hEvent, timeout) != WAIT_OBJECT_0) {
+			// took longer than specified timeout or other error - cancel read
+			CancelIo(pipe_handle);
+			WaitForSingleObject(pipe_overlapped.hEvent, INFINITE); //wait for cancelation to finish properly.
+			result = 0;
+		}
+	}
+	//ACTF("ReadFile GLE %d", GetLastError());
+	//ACTF("read from pipe '%c'", result);
+	return result;
+}
+
+void WriteCommandToPipe(char cmd)
+{
+	DWORD num_written;
+	//ACTF("write to pipe '%c'", cmd);
+	WriteFile(pipe_handle, &cmd, 1, &num_written, &pipe_overlapped);
+}
+
 static void setup_watchdog_timer() {
 	watchdog_enabled = 0;
 	InitializeCriticalSection(&critical_section);
@@ -2606,6 +2705,49 @@ static int is_child_running() {
   LeaveCriticalSection(&critical_section);
 
   return ret;
+}
+
+//Define the function prototypes
+typedef int (APIENTRY* dll_run)(char*, long, int);
+typedef int (APIENTRY* dll_init)();
+
+// custom server functions
+dll_run dll_run_ptr = NULL;
+dll_init dll_init_ptr = NULL;
+
+char *get_test_case(long *fsize)
+{
+  /* open generated file */
+  s32 fd = out_fd;
+  if (out_file != NULL)
+    fd = open(out_file, O_RDONLY | O_BINARY);
+
+  *fsize = lseek(fd, 0, SEEK_END);
+  lseek(fd, 0, SEEK_SET);
+
+  /* allocate buffer to read the file */
+  char *buf = malloc(*fsize);
+  ck_read(fd, buf, *fsize, "input file");
+
+  return buf;
+}
+
+/* This function is used to call user-defined server routine to send data back into sample */
+static int process_test_case_into_dll(int fuzz_iterations)
+{
+  int result;
+  long fsize;
+
+  char *buf = get_test_case(&fsize);
+
+  result = dll_run_ptr(buf, fsize, fuzz_iterations); /* caller should copy the buffer */
+
+  free(buf);
+
+  if (result == 0)
+    FATAL("Unable to process test case, the user-defined DLL returned 0");
+
+  return 1;
 }
 
 /* Execute target application, monitoring for timeouts. Return status
@@ -2632,9 +2774,7 @@ static u8 run_target_dynamo(char** argv, u32 timeout) {
 static u8 run_target(char** argv, u32 timeout) {
 #endif
   //todo watchdog timer to detect hangs
-
-  char command[] = "F";
-  DWORD num_read;
+  DWORD num_read, dwThreadId;
   char result = 0;
 
   if(sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
@@ -2652,6 +2792,11 @@ static u8 run_target(char** argv, u32 timeout) {
     }
   }
 
+  if (custom_dll_defined) {
+    if (!dll_init_ptr())
+      PFATAL("User-defined custom initialization routine returned 0");
+  }
+
   if(!is_child_running()) {
 #ifdef INTELPT
     destroy_target_process_dynamo(0);
@@ -2663,23 +2808,42 @@ static u8 run_target(char** argv, u32 timeout) {
     fuzz_iterations_current = 0;
   }
 
+  if (custom_dll_defined)
+    process_test_case_into_dll(fuzz_iterations_current);
+
   child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
   MemoryBarrier();
-
-  WriteFile( 
-    pipe_handle,        // handle to pipe 
-    command,     // buffer to write from 
-    1, // number of bytes to write 
-    &num_read,   // number of bytes written 
-    NULL);        // not overlapped I/O 
-
-
-  watchdog_timeout_time = get_cur_time() + timeout;
+  if (fuzz_iterations_current == 0 && init_tmout != 0) {
+	  watchdog_timeout_time = get_cur_time() + init_tmout;
+  }
+  else {
+	  watchdog_timeout_time = get_cur_time() + timeout;
+  }
   watchdog_enabled = 1;
+  result = ReadCommandFromPipe(timeout);
+  if (result == 'K')
+  {
+	  //a workaround for first cycle in app persistent mode
+	  result = ReadCommandFromPipe(timeout);
+  }
+  if (result == 0) 
+  {
+	  //saves us from getting stuck in corner case.
+	  MemoryBarrier();
+	  watchdog_enabled = 0;
 
-  ReadFile(pipe_handle, &result, 1, &num_read, NULL);
+      destroy_target_process(0);
+      return FAULT_TMOUT;
+  }
+  if (result != 'P')
+  {
+	  FATAL("Unexpected result from pipe! expected 'P', instead received '%c'\n", result);
+  }
+  WriteCommandToPipe('F');
 
+  result = ReadCommandFromPipe(timeout); //no need to check for "error(0)" since we are exiting anyway
+  //ACTF("result: '%c'", result);
   MemoryBarrier();
   watchdog_enabled = 0;
 
@@ -2878,46 +3042,12 @@ static void write_to_testcase(void* mem, u32 len) {
 /* The same, but with an adjustable gap. Used for trimming. */
 
 static void write_with_gap(char* mem, u32 len, u32 skip_at, u32 skip_len) {
-
-  s32 fd = out_fd;
-  u32 tail_len = len - skip_at - skip_len;
-
-  if (out_file) {
-
-    unlink(out_file); /* Ignore errors. */
-
-    fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
-
-    if (fd < 0) {
-#ifdef INTELPT
-      if(intelpt_mode)
-        destroy_target_process_intelpt(0);
-      else
-        destroy_target_process_dynamo(0);
-#else
-      destroy_target_process(0);
-#endif
-
-	  unlink(out_file); /* Ignore errors. */
-
-      fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
-
-      if (fd < 0) PFATAL("Unable to create '%s'", out_file);
-	}
-
-  } else lseek(fd, 0, SEEK_SET);
-
-  if (skip_at) ck_write(fd, mem, skip_at, out_file);
-
-  if (tail_len) ck_write(fd, mem + skip_at + skip_len, tail_len, out_file);
-
-  if (!out_file) {
-
-    if (_chsize(fd, len - skip_len)) PFATAL("ftruncate() failed");
-    lseek(fd, 0, SEEK_SET);
-
-  } else close(fd);
-
+  
+  char* trimmed_mem = malloc(len - skip_len);
+  memcpy(trimmed_mem, mem, skip_at); //copy start
+  memcpy(trimmed_mem + skip_at, mem + skip_at + skip_len, len - (skip_at + skip_len));
+  write_to_testcase(trimmed_mem, len - skip_len);
+  free(trimmed_mem);
 }
 
 
@@ -3893,6 +4023,41 @@ static u8 delete_files(u8* path, u8* prefix) {
 }
 
 
+static u8 delete_subdirectories(u8* path) {
+	char *pattern;
+	WIN32_FIND_DATA fd;
+	HANDLE h;
+
+	if (_access(path, 0)) return 0;
+
+	pattern = alloc_printf("%s\\*", path);
+
+	h = FindFirstFile(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE) {
+		ck_free(pattern);
+		return !!_rmdir(path);
+	}
+
+	do {
+		if (fd.cFileName[0] != '.') {
+
+			u8* fname = alloc_printf("%s\\%s", path, fd.cFileName);
+			if (delete_files(fname, NULL)) PFATAL("Unable to delete '%s'", fname);
+			ck_free(fname);
+
+		}
+
+	} while (FindNextFile(h, &fd));
+
+	FindClose(h);
+
+	ck_free(pattern);
+
+	return !!_rmdir(path);
+
+}
+
+
 /* Get the number of runnable processes, with some simple smoothing. */
 
 static double get_runnable_processes(void) {
@@ -4187,6 +4352,10 @@ static void maybe_delete_out_dir(void) {
 
   fn = alloc_printf("%s\\plot_data", out_dir);
   if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
+  ck_free(fn);
+
+  fn = alloc_printf("%s\\drcache", out_dir);
+  if(delete_subdirectories(fn)) goto dir_cleanup_failed;
   ck_free(fn);
 
   OKF("Output dir cleanup successful.");
@@ -7209,7 +7378,7 @@ static void usage(u8* argv0) {
 
        "Execution control settings:\n\n"
 
-       "  -f file       - location read by the fuzzed program (stdin)\n"
+       "  -f file       - location read by the fuzzed program (stdin)\n\n"
  
        "Fuzzing behavior settings:\n\n"
 
@@ -7218,8 +7387,10 @@ static void usage(u8* argv0) {
 
        "Other stuff:\n\n"
 
+       "  -I msec       - timeout for process initialization and first run\n"
        "  -T text       - text banner to show on the screen\n"
        "  -M \\ -S id    - distributed mode (see parallel_fuzzing.txt)\n"
+       "  -l path       - a path to user-defined DLL for custom test cases processing\n\n"
 
        "For additional tips, please consult %s\\README.\n\n",
 
@@ -7339,6 +7510,10 @@ static void setup_dirs_fds(void) {
                      "pending_total, pending_favs, map_size, unique_crashes, "
                      "unique_hangs, max_depth, execs_per_sec\n");
                      /* ignore errors */
+
+  tmp = alloc_printf("%s\\drcache", out_dir);
+  if (mkdir(tmp)) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
 
 }
 
@@ -7825,6 +8000,29 @@ int getopt(int argc, char **argv, char *optstring) {
   }
 }
 
+/* This routine is designed to load user-defined library for custom test cases processing */
+void load_custom_library(const char *libname)
+{
+  int result = 0;
+  SAYF("Loading custom winAFL server library\n");
+  HMODULE hLib = LoadLibraryA(libname);
+  if (hLib == NULL)
+    FATAL("Unable to load custom server library, GetLastError = 0x%x", GetLastError());
+
+  /* init the custom server */
+  // Get pointer to user-defined server initialization function using GetProcAddress:
+  dll_init_ptr = (dll_init)GetProcAddress(hLib, "_dll_init@0");
+  if (dll_init_ptr == NULL)
+    FATAL("Unable to load _dll_init from the DLL provided by user");
+
+  //Get pointer to user-defined test cases sending function using GetProcAddress:
+  dll_run_ptr = (dll_run)GetProcAddress(hLib, "_dll_run@12");
+  if (dll_run_ptr == NULL)
+    FATAL("Unable to load _dll_run from the DLL provided by user");
+
+  SAYF("Sucessfully loaded and initalized\n");
+}
+
 /* Main entry point */
 int main(int argc, char** argv) {
 
@@ -7857,11 +8055,10 @@ int main(int argc, char** argv) {
 #ifdef INTELPT
   while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QPKD:b:")) > 0)
 #else
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:I:T:dYnCB:S:M:x:QD:b:l:p")) > 0)
 #endif
 
     switch (opt) {
-
       case 'i':
 
         if (in_dir) FATAL("Multiple -i options not supported");
@@ -7940,6 +8137,16 @@ int main(int argc, char** argv) {
           break;
 
       }
+
+	  case 'I': {
+
+		  if (sscanf(optarg, "%u", &init_tmout) < 1) FATAL("Bad syntax used for -I");
+
+		  if (init_tmout < 5) FATAL("Dangerously low value of -I");
+
+		  break;
+
+	  }
 
       case 'm': {
 
@@ -8055,6 +8262,17 @@ int main(int argc, char** argv) {
         drioless = 1;
 
         break;
+
+      case 'l':
+        custom_dll_defined = 1;
+        load_custom_library(optarg);
+
+        break;
+
+	  case 'p':
+		  persist_dr_cache = 1;
+
+		  break;
 
       default:
 

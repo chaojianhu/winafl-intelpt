@@ -55,8 +55,14 @@ user wants to fuzz) and instrumenting it so that it runs in a loop.
 WinAFL has been successfully used to identify bugs in Windows software, such as
 
  * [Microsoft] CVE-2016-7212 - found by Aral Yaman of Noser Engineering AG
- * [Microsoft] CVE-2017-0073, CVE-2017-0190, CVE-2017-11816 - found by [Symeon Paraschoudis](https://twitter.com/symeonp) of SensePost
- * [Adobe] CVE-2018-4985, CVE-2018-5063, CVE-2018-5064, CVE-2018-5065, CVE-2018-5068, CVE-2018-5069, CVE-2018-5070, CVE-2018-12754, CVE-2018-12755, CVE-2018-12764, CVE-2018-12765, CVE-2018-12766, CVE-2018-12767, CVE-2018-12768 - found by Yoav Alon and Netanel Ben-Simon from Check Point Software Technologies
+ * [Microsoft] CVE-2017-0073, CVE-2017-0190, CVE-2017-11816, CVE-2018-8472 - found by [Symeon Paraschoudis](https://twitter.com/symeonp)
+ * [Microsoft] CVE-2018-8494 - found by Guy Inbar (guyio)
+ * [Microsoft] CVE-2018-8464 - found by Omri Herscovici of Check Point
+ * [Adobe] CVE-2018-4985, CVE-2018-5063, CVE-2018-5064, CVE-2018-5065, CVE-2018-5068, CVE-2018-5069, CVE-2018-5070, CVE-2018-12754, CVE-2018-12755, CVE-2018-12764, CVE-2018-12765, CVE-2018-12766, CVE-2018-12767, CVE-2018-12768, CVE-2018-12848, CVE-2018-12849, CVE-2018-12850, CVE-2018-12840, CVE-2018-15956, CVE-2018-15955, CVE-2018-15954,CVE-2018-15953, CVE-2018-15952, CVE-2018-15938, CVE-2018-15937, CVE-2018-15936, CVE-2018-15935, CVE-2018-15934, CVE-2018-15933, CVE-2018-15932 , CVE-2018-15931, CVE-2018-15930 , CVE-2018-15929, CVE-2018-15928, CVE-2018-15927, CVE-2018-12875, CVE-2018-12874 , CVE-2018-12873, CVE-2018-12872,CVE-2018-12871, CVE-2018-12870, CVE-2018-12869, CVE-2018-12867 , CVE-2018-12866, CVE-2018-12865 , CVE-2018-12864 , CVE-2018-12863, CVE-2018-12862, CVE-2018-12861, CVE-2018-12860, CVE-2018-12859, CVE-2018-12857, CVE-2018-12839 - found by Yoav Alon and Netanel Ben-Simon from Check Point Software Technologies
+ * [Adobe] CVE-2018-12853, CVE-2018-16024, CVE-2018-16023, CVE-2018-15995 - found by Guy Inbar (guyio)
+ * [Kollective Kontiki 10.0.1] CVE-2018-11672 - found by Maksim Shudrak from Salesforce
+ * [Mozilla] CVE-2018-5177 - found by Guy Inbar (guyio)
+ * [libxml2] CVE-2018-14404 - found by Guy Inbar (guyio)
  
 (Let me know if you know of any others and I'll include them in the list)
 
@@ -80,7 +86,7 @@ source directory).
 ```
 mkdir build32
 cd build32
-cmake .. -DDynamoRIO_DIR=..\path\to\DynamoRIO\cmake
+cmake -G"Visual Studio 15 2017" .. -DDynamoRIO_DIR=..\path\to\DynamoRIO\cmake
 cmake --build . --config Release
 ```
 
@@ -89,7 +95,7 @@ cmake --build . --config Release
 ```
 mkdir build64
 cd build64
-cmake -G"Visual Studio 10 Win64" .. -DDynamoRIO_DIR=..\path\to\DynamoRIO\cmake
+cmake -G"Visual Studio 15 2017 Win64" .. -DDynamoRIO_DIR=..\path\to\DynamoRIO\cmake
 cmake --build . --config Release
 ```
 
@@ -121,7 +127,9 @@ The following afl-fuzz options are supported:
   -i dir        - input directory with test cases
   -o dir        - output directory for fuzzer findings
   -D dir        - directory containing DynamoRIO binaries (drrun, drconfig)
+  -p            - persist DynamoRIO cache across target process restarts
   -t msec       - timeout for each run
+  -I msec       - timeout for process initialization and first run
   -f file       - location read by the fuzzed program
   -M \\ -S id   - distributed mode
   -x dir        - optional fuzzer dictionary
@@ -197,7 +205,7 @@ Example command line:
 
 ```
 path\to\DynamoRIO\bin64\drrun.exe -c winafl.dll -debug
--target_module test_gdiplus.exe -target_offset 0x1270 -fuzz_iterations 10
+-target_module test_gdiplus.exe -target_offset 0x16e0 -fuzz_iterations 10
 -nargs 2 -- test_gdiplus.exe input.bmp
 ```
 
@@ -238,7 +246,7 @@ An example command line would look like:
 ```
 afl-fuzz.exe -i in -o out -D C:\work\winafl\DynamoRIO\bin64 -t 20000 --
 -coverage_module gdiplus.dll -coverage_module WindowsCodecs.dll
--fuzz_iterations 5000 -target_module test_gdiplus.exe -target_offset 0x1270
+-fuzz_iterations 5000 -target_module test_gdiplus.exe -target_offset 0x16e0
 -nargs 2 -- test_gdiplus.exe @@
 ```
 
@@ -280,6 +288,34 @@ The target function should do these things during its lifetime:
 4. Return normally (So that WinAFL can "catch" this return and redirect
    execution. "returning" via ExitProcess() and such won't work)
 
+## In App Persistence mode
+
+This feature is a tweak for the traditional "target function" approach and aims
+to loosen the requirements of the target function to do both reading
+an input file and processing the input file.
+
+In some applications it's quite challenging to find a target function
+that with a simple execution redirection won't break global states and will do
+both reading and processing of inputs.
+
+This mode assumes that the target application will actually loop
+the target function by itself, and will handle properly its global state
+For example a udp server handling packets or a js interpreter running inside
+a while loop.
+
+This mode works as following:
+1. Your target runs until hitting the target function.
+2. The afl server starts instrumenting the target.
+3. Your target runs until hitting the target function again.
+4. The afl server stops instrumenting current cycle and starts a new one.
+
+usage: add the following option to the winafl arguments:
+-persistence_mode in_app
+
+example usage on the supplied test.exe:
+afl-fuzz.exe -i in -o out -D <dynamorio bin path> -t 100+ -- -coverage_module test.exe -fuzz_iterations 5000 -target_module test.exe -target_offset 0x1000 -nargs 2 -persistence_mode in_app -- test.exe @@ loop
+
+
 ## Corpus minimization
 
 WinAFL includes the windows port of afl-cmin in winafl-cmin.py. Please run the
@@ -308,6 +344,50 @@ Examples of use:
 <p align="center">
 <img alt="winafl-cmin.py" src="screenshots/winafl-cmin.py.png"/>
 </p>
+
+## Custom test cases processing
+
+WinAFL supports third party DLLs that can be used to define custom test-cases processing (e.g. to send test cases over network). To enable this option, you need to specify ```-l <path>``` argument.
+The DLL should export the following two functions:
+```
+dll_init()
+dll_run(char *data, long size, int fuzz_iterations)
+data - content of test case
+size - size of test case
+fuzz_iterations - defines a current fuzzing iteration number
+```
+
+We have implemented two sample DLLs for network-based applications fuzzing that you can customize for your own purposes.
+
+### Network fuzzing
+
+WinAFL's ```custom_net_fuzzer.dll``` allows winAFL to perform network-based applications fuzzing that receive and parse network data. There are several options supported by this DLL that should be provided via the environment variable ```AFL_CUSTOM_DLL_ARGS```:
+
+```
+  -a IP address - IP address to send data in
+  -U            - use UDP protocol instead of TCP to send data (default TCP)
+  -p port       - port to send data in
+  -w msec       - delay in milliseconds before actually start fuzzing
+```
+For example, if your application receives network packets via UDP protocol at port 7714 you should setup environment variable in the following way: ```set AFL_CUSTOM_DLL_ARGS=-U -p 7714 -a 127.0.0.1 -w 1000 ```
+
+You still need to find target function and make sure that this function receives data from the network, parses it, and returns normally. Also, you can use In App Persistence mode described above if your application runs the target function in a loop by its own.
+
+Additionally, this mode is considered as experimental since we have experienced some problems with stability and performance. However, we found this option very usefull and managed to find several vulnerabilities in network-based applications (e.g. in Kollective Kontiki listed above).
+
+There is a second DLL ```custom_winafl_server.dll``` that allows winAFL to act as a server and perform fuzzing of client-based applications. All you need is to setup port to listen on for incoming connections from your target application. The environment variable ```AFL_CUSTOM_DLL_ARGS=<port_id>``` should be used for this purpose.
+
+#### Note
+In case of server fuzzing, if the server socket has the `SO_REUSEADDR` option set like the following code, then this may case `10055` error after some time fuzzing due to the accumulation of `TIME_WAIT` sockets when WinAFL restart the fuzzing process. 
+```
+setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(int));
+```
+
+To avoid this replace the `SO_REUSEADDR` option by `SO_LINGER` option in the server source code if availabe.
+```
+setsockopt(s, SOL_SOCKET, SO_LINGER, (char*)&opt, sizeof(int));
+```
+
 
 ## Statically instrument a binary via [syzygy](https://github.com/google/syzygy)
 
