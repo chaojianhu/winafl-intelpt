@@ -65,17 +65,13 @@
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
 // IntelPT includes
-#define INTELPT
-#define PROCESS_DEBUG
+#define INTELPT 1
+#define PROCESS_DEBUG 0
+#define MEM_LIMIT_INTELPT   200
 
 #ifdef INTELPT
-#define MEM_LIMIT_INTELPT   200
-//#include "../ptcov/ptcov.h"
-//#pragma comment (lib, "ptcov.lib")
-//#include "../winipt/inc/libipt.h"
-#include "libipt.h"
-//#pragma comment (lib, "..\\winipt\\x64\\Release\\libipt.lib")
-//PtCovCtx ptcov = NULL;
+#include ".\\winipt\\inc\\libipt.h"
+#pragma comment (lib, "..\\winipt\\x64\\Release\\libipt.lib")
 
 #define IPT_TOOL_USE_MTC_TIMING_PACKETS     0x01
 #define IPT_TOOL_USE_CYC_TIMING_PACKETS     0x02
@@ -92,8 +88,16 @@ typedef enum _IPT_TL_ACTION
 {
 	IptTlStartTrace,
 	IptTlStopTrace,
-	IptTlGetTrace
+	IptTlGetTrace,
+	IptTlQueryTrace,
+	IptTlPauseTrace,
+	IptTlResumeTrace
 } IPT_TL_ACTION;
+
+IPT_OPTIONS ipt_options = { 0 };
+HANDLE hIptTraceFile = INVALID_HANDLE_VALUE;
+PIPT_TRACE_DATA pIptTraceData = { 0 };
+
 
 FORCEINLINE
 DWORD
@@ -135,19 +139,19 @@ EnableIpt(
 	//
 	// Open a handle to the SCM
 	//
-	hScm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+	hScm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
 	if (hScm != NULL)
 	{
 		//
 		// Open a handle to the IPT Service
 		//
-		hSc = OpenService(hScm, "Ipt", SERVICE_START);
+		hSc = OpenServiceW(hScm, L"Ipt", SERVICE_START);
 		if (hSc != NULL)
 		{
 			//
 			// Start it
 			//
-			bRes = StartService(hSc, 0, NULL);
+			bRes = StartServiceW(hSc, 0, NULL);
 			if ((bRes == FALSE) &&
 				(GetLastError() == ERROR_SERVICE_ALREADY_RUNNING))
 			{
@@ -158,11 +162,11 @@ EnableIpt(
 			}
 			else if (bRes == FALSE)
 			{
-				wprintf(L"[-] Unable to start IPT Service (err=%d)\n",
+				fwprintf(stderr, L"[-] Unable to start IPT Service (err=%d)\n",
 					GetLastError());
 				if (GetLastError() == ERROR_NOT_SUPPORTED)
 				{
-					wprintf(L"[-] This is likely due to missing PT support\n");
+					fwprintf(stderr, L"[-] This is likely due to missing PT support\n");
 				}
 			}
 
@@ -173,7 +177,7 @@ EnableIpt(
 		}
 		else
 		{
-			wprintf(L"[-] Unable to open IPT Service (err=%d). "
+			fwprintf(stderr, L"[-] Unable to open IPT Service (err=%d). "
 				L"Are you running Windows 10 1809?\n",
 				GetLastError());
 		}
@@ -185,7 +189,7 @@ EnableIpt(
 	}
 	else
 	{
-		wprintf(L"[-] Unable to open a handle to the SCM (err=%d)\n",
+		fwprintf(stderr, L"[-] Unable to open a handle to the SCM (err=%d)\n",
 			GetLastError());
 	}
 
@@ -210,7 +214,7 @@ EnableAndValidateIptServices(
 	bRes = EnableIpt();
 	if (bRes == FALSE)
 	{
-		wprintf(L"[-] Intel PT Service could not be started!\n");
+		fwprintf(stderr, L"[-] Intel PT Service could not be started!\n");
 		goto Cleanup;
 	}
 
@@ -220,13 +224,13 @@ EnableAndValidateIptServices(
 	bRes = GetIptBufferVersion(&dwBufferVersion);
 	if (bRes == FALSE)
 	{
-		wprintf(L"[-] Failed to communicate with IPT Service: (err=%d)\n",
+		fwprintf(stderr, L"[-] Failed to communicate with IPT Service: (err=%d)\n",
 			GetLastError());
 		goto Cleanup;
 	}
 	if (dwBufferVersion != IPT_BUFFER_MAJOR_VERSION_CURRENT)
 	{
-		wprintf(L"[-] IPT Service buffer version is not supported: %d\n",
+		fwprintf(stderr, L"[-] IPT Service buffer version is not supported: %d\n",
 			dwBufferVersion);
 		goto Cleanup;
 	}
@@ -237,13 +241,13 @@ EnableAndValidateIptServices(
 	bRes = GetIptTraceVersion(&wTraceVersion);
 	if (bRes == FALSE)
 	{
-		wprintf(L"[-] Failed to get Trace Version from IPT Service (err=%d)\n",
+		fwprintf(stderr, L"[-] Failed to get Trace Version from IPT Service (err=%d)\n",
 			GetLastError());
 		goto Cleanup;
 	}
 	if (wTraceVersion != IPT_TRACE_VERSION_CURRENT)
 	{
-		wprintf(L"[-] IPT Service trace version is not supported %d\n",
+		fwprintf(stderr, L"[-] IPT Service trace version is not supported %d\n",
 			wTraceVersion);
 		goto Cleanup;
 	}
@@ -254,7 +258,6 @@ Cleanup:
 	//
 	return bRes;
 }
-
 
 BOOL
 ConfigureTraceFlags(
@@ -272,7 +275,7 @@ ConfigureTraceFlags(
 	dwFlags = wcstoul(pwszFlags, NULL, 16);
 	if (dwFlags & ~IPT_TOOL_VALID_FLAGS)
 	{
-		wprintf(L"[-] Invalid flags: %s\n", pwszFlags);
+		fwprintf(stderr, L"[-] Invalid flags: %s\n", pwszFlags);
 		goto Cleanup;
 	}
 
@@ -283,7 +286,7 @@ ConfigureTraceFlags(
 	if ((dwFlags & IPT_TOOL_USE_CYC_TIMING_PACKETS) &&
 		!(dwFlags & IPT_TOOL_USE_MTC_TIMING_PACKETS))
 	{
-		wprintf(L"[*] CYC Packets require MTC packets, adjusting flags!\n");
+		fwprintf(stderr, L"[*] CYC Packets require MTC packets, adjusting flags!\n");
 		dwFlags |= IPT_TOOL_USE_MTC_TIMING_PACKETS;
 	}
 
@@ -294,7 +297,7 @@ ConfigureTraceFlags(
 	if ((dwFlags & (IPT_TOOL_TRACE_KERNEL_MODE | IPT_TOOL_TRACE_ALL_MODE)) ==
 		(IPT_TOOL_TRACE_KERNEL_MODE | IPT_TOOL_TRACE_ALL_MODE))
 	{
-		wprintf(L"[-] Cannot enable both `kernel` and `user + kernel` tracing."
+		fwprintf(stderr, L"[-] Cannot enable both `kernel` and `user + kernel` tracing."
 			L" Please pick a single flag to use!\n");
 		goto Cleanup;
 	}
@@ -342,7 +345,7 @@ ConfigureTraceFlags(
 	// Print out chosen options
 	//
 	bRes = TRUE;
-	wprintf(L"[+] Tracing Options:\n"
+	fwprintf(stderr, L"[+] Tracing Options:\n"
 		L"           Match by: %s\n"
 		L"         Trace mode: %s\n"
 		L"     Timing packets: %s\n",
@@ -379,7 +382,7 @@ ConfigureBufferSize(
 	dwSize = wcstoul(pwszSize, NULL, 10);
 	if (dwSize == 0)
 	{
-		wprintf(L"[-] Invalid size: %s\n", pwszSize);
+		fwprintf(stderr, L"[-] Invalid size: %s\n", pwszSize);
 		goto Cleanup;
 	}
 
@@ -388,15 +391,15 @@ ConfigureBufferSize(
 	//
 	if (!((dwSize) && ((dwSize & (~dwSize + 1)) == dwSize)))
 	{
-		wprintf(L"[*] Size will be aligned to a power of 2\n");
+		fwprintf(stderr, L"[*] Size will be aligned to a power of 2\n");
 	}
 	else if (dwSize < 4096)
 	{
-		wprintf(L"[*] Size will be set to minimum of 4KB\n");
+		fwprintf(stderr, L"[*] Size will be set to minimum of 4KB\n");
 	}
 	else if (dwSize >(128 * 1024 * 1024))
 	{
-		wprintf(L"[*] Size will be set to a maximum of 128MB\n");
+		fwprintf(stderr, L"[*] Size will be set to a maximum of 128MB\n");
 	}
 
 	//
@@ -404,7 +407,7 @@ ConfigureBufferSize(
 	//
 	pOptions->TopaPagesPow2 = ConvertToPASizeToSizeOption(dwSize);
 	bRes = TRUE;
-	wprintf(L"[+] Using size: %d bytes\n",
+	fwprintf(stderr, L"[+] Using size: %d bytes\n",
 		1 << (pOptions->TopaPagesPow2 + 12));
 
 Cleanup:
@@ -414,17 +417,87 @@ Cleanup:
 	return bRes;
 }
 
+BOOL
+ConfigureProcess(
+	_In_ PWCHAR pwszPid,
+	_Out_ PHANDLE phProcess
+)
+{
+	DWORD dwPid;
+	BOOL bRes;
+	bRes = FALSE;
+	*phProcess = NULL;
 
-DWORD dwTraceSize;
-HANDLE hProcess;
-HANDLE hTraceFile;
-DWORD dwResult;
-IPT_TL_ACTION dwAction;
-IPT_OPTIONS options;
-PIPT_TRACE_DATA pTraceData;
-PIPT_TRACE_HEADER traceHeader;
-DWORD dwEntries;
-#endif
+	//
+	// Get the PID first
+	//
+	dwPid = wcstoul(pwszPid, NULL, 0);
+	if (dwPid == 0)
+	{
+		fwprintf(stderr, L"[-] Invalid PID: %s\n", pwszPid);
+		goto Cleanup;
+	}
+
+	//
+	// Open a handle to it
+	//
+	*phProcess = OpenProcess(PROCESS_VM_READ, FALSE, dwPid);
+	if (*phProcess == NULL)
+	{
+		fwprintf(stderr, L"[-] Unable to open PID %d (err=%d)\n",
+			dwPid, GetLastError());
+		goto Cleanup;
+	}
+	bRes = TRUE;
+
+Cleanup:
+	//
+	// Return result
+	//
+	return bRes;
+}
+
+BOOL
+ConfigureThread(
+	_In_ PWCHAR pwszTid,
+	_Out_ PHANDLE phThread
+)
+{
+	DWORD dwPid;
+	BOOL bRes;
+	bRes = FALSE;
+	*phThread = NULL;
+
+	//
+	// Get the PID first
+	//
+	dwPid = wcstoul(pwszTid, NULL, 0);
+	if (dwPid == 0)
+	{
+		fwprintf(stderr, L"[-] Invalid TID: %s\n", pwszTid);
+		goto Cleanup;
+	}
+
+	//
+	// Open a handle to it
+	//
+	*phThread = OpenThread(THREAD_GET_CONTEXT, FALSE, dwPid);
+	if (*phThread == NULL)
+	{
+		fwprintf(stderr, L"[-] Unable to open TID %d (err=%d)\n",
+			dwPid, GetLastError());
+		goto Cleanup;
+	}
+	bRes = TRUE;
+
+Cleanup:
+	//
+	// Return result
+	//
+	return bRes;
+}
+
+#endif // INTELPT
 
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
@@ -490,7 +563,7 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
 
-HANDLE child_handle, child_thread_handle;
+HANDLE child_handle, child_thread_handle, child_debug_handle, child_debug_thread_handle;
 char *dynamorio_dir;
 char *client_params;
 int fuzz_iterations_max = 5000, fuzz_iterations_current;
@@ -2807,7 +2880,7 @@ static void create_target_process_intelpt(char** argv) {
     inherit_handles = FALSE;
   }
 
-#ifdef PROCESS_DEBUG
+#if PROCESS_DEBUG
   if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW | DEBUG_ONLY_THIS_PROCESS, NULL, NULL, &si, &pi)) {
 #else
   if (!CreateProcess(NULL, target_cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
@@ -2817,6 +2890,7 @@ static void create_target_process_intelpt(char** argv) {
   child_handle = pi.hProcess;
   child_thread_handle = pi.hThread;
   child_pid = pi.dwProcessId;
+  printf("CHILD PID %d\n", child_pid);
 
   if (persistent_mode)
   {
@@ -3175,8 +3249,11 @@ static u8 run_target(char** argv, u32 timeout) {
 	  //saves us from getting stuck in corner case.
 	  MemoryBarrier();
 	  watchdog_enabled = 0;
-
+#ifdef INTELPT
+	  destroy_target_process_dynamo(0);
+#else
       destroy_target_process(0);
+#endif
       return FAULT_TMOUT;
   }
   if (result != 'P')
@@ -3282,7 +3359,7 @@ static u8 run_target_intelpt_persistent(char** argv) {
   total_execs++;
   fuzz_iterations_current++;
 
-  //Sleep(1); // XXX this is hacky
+
   if (fuzz_iterations_current == fuzz_iterations_max) {
     destroy_target_process_intelpt(2000);
     fuzz_iterations_current = 0;
@@ -3301,10 +3378,302 @@ static u8 run_target_intelpt_persistent(char** argv) {
   return FAULT_TMOUT;
 }
 
+/////////////////////////////////////////////////////////////////////////////
+intelpt_trace_ctl(IPT_TL_ACTION dwAction)
+{
+	BOOL bRes = FALSE;
+
+	DWORD dwTraceSize;
+	HANDLE hProcess;
+	HANDLE hThread;
+	DWORD dwResult;
+	PIPT_TRACE_HEADER traceHeader;
+	DWORD dwEntries;
+
+	hProcess = OpenProcess(PROCESS_VM_READ, FALSE, GetProcessId(child_handle));
+	hThread = child_thread_handle;
+
+	printf("TRACECTL pid: %d hProcess: %x tid: %d hThread: %x\n", GetProcessId(hProcess), hProcess, GetThreadId(hThread), hThread);
+	//
+	// Check what we're doing
+	//
+	switch (dwAction)
+	{
+	case IptTlStartTrace:
+	{
+		//
+		// Start the trace
+		//
+		bRes = StartProcessIptTracing(hProcess, ipt_options);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to start a trace (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Print out the status
+		//
+		fwprintf(stderr, L"[+] Trace for PID %d started\n",
+			GetProcessId(hProcess));
+		dwResult = 0;
+		break;
+	}
+
+	case IptTlStopTrace:
+	{
+		//
+		// Stop the trace
+		//
+		bRes = StopProcessIptTracing(hProcess);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to stop the trace (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Print out the status
+		//
+		fwprintf(stderr, L"[+] Trace for PID %d stopped\n",
+			GetProcessId(hProcess));
+		dwResult = 0;
+		break;
+	}
+
+	case IptTlQueryTrace:
+	{
+		//
+		// Query the trace
+		//
+		bRes = QueryProcessIptTracing(hProcess, &ipt_options);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Tracing is not enabled for this process\n");
+			goto Cleanup;
+		}
+
+		//
+		// Print out the status
+		//
+		fwprintf(stderr, L"[+] Tracing Options:\n"
+			L"           Match by: %s\n"
+			L"         Trace mode: %s\n"
+			L"     Timing packets: %s\n",
+			L"Any process",
+			(ipt_options.ModeSettings == IptCtlUserAndKernelMode) ?
+			L"Kernel and user-mode" :
+			(ipt_options.ModeSettings == IptCtlKernelModeOnly) ?
+			L"Kernel-mode only" : L"User-mode only",
+			(ipt_options.TimingSettings == IptEnableMtcPackets) ?
+			L"MTC Packets" :
+			(ipt_options.TimingSettings == IptEnableCycPackets) ?
+			L"CYC Packets" : L"No  Packets");
+		dwResult = 0;
+		break;
+	}
+
+	case IptTlPauseTrace:
+	{
+		BOOLEAN result = FALSE;
+		//
+		// Pause tracing for this thread
+		//
+		bRes = PauseThreadIptTracing(hThread, &result);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to pause the trace (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Print result
+		//
+		fwprintf(stderr, L"Trace for TID %d paused, it was previously %s\n",
+			GetThreadId(hThread),
+			(result == 1) ? L"active" : L"paused");
+		dwResult = 0;
+		break;
+	}
+
+	case IptTlResumeTrace:
+	{
+		//
+		// Resume tracing for this thread
+		//
+		BOOLEAN result = FALSE;
+		bRes = ResumeThreadIptTracing(hThread, &result);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to resume the trace (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Print result
+		//
+		fwprintf(stderr, L"Trace for TID %d resumed, it was previously %s\n",
+			GetThreadId(hThread),
+			(result == 1) ? L"active" : L"paused");
+		dwResult = 0;
+		break;
+	}
+
+	case IptTlGetTrace:
+	{
+		//
+		// Get the size of the trace
+		//
+		bRes = GetProcessIptTraceSize(hProcess, &dwTraceSize);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to query trace size (err=%d). "
+				L"Are you sure one is active?\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Allocate a local buffer
+		//
+		pIptTraceData = HeapAlloc(GetProcessHeap(),
+			HEAP_ZERO_MEMORY,
+			dwTraceSize);
+		if (pIptTraceData == NULL)
+		{
+			fwprintf(stderr, L"[-] Out of memory while trying to allocate trace data\n");
+			goto Cleanup;
+		}
+
+		//
+		// Query the trace
+		//
+		fwprintf(stderr, L"[+] Found active trace with %d bytes so far\n", dwTraceSize);
+		bRes = GetProcessIptTrace(hProcess, pIptTraceData, dwTraceSize);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to query trace (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Compute the number of thread entries in the trace data
+		//
+		dwEntries = (dwTraceSize - (dwTraceSize & ~0xFFF)) /
+			FIELD_OFFSET(IPT_TRACE_HEADER, Trace);
+		fwprintf(stderr, L"    [+] Trace contains %d thread headers\n", dwEntries);
+
+		//
+		// Parse each entry
+		//
+		traceHeader = (PIPT_TRACE_HEADER)pIptTraceData->TraceData;
+		for (int i = 0; i < dwEntries; i++)
+		{
+			//
+			// Print out information from it
+			//
+			fwprintf(stderr, L"        [+] Trace Entry %d for TID %p\n",
+				i,
+				traceHeader->ThreadId);
+			fwprintf(stderr, L"               Trace Size: %08d     "
+				L"        [Ring Buffer Offset: %d]\n",
+				traceHeader->TraceSize,
+				traceHeader->RingBufferOffset);
+			fwprintf(stderr, L"              Timing Mode: %s  "
+				L"        [MTC Frequency: %d, ClockTsc Ratio: %d]\n",
+				(traceHeader->TimingSettings == IptEnableMtcPackets) ?
+				L"MTC Packets" :
+				(traceHeader->TimingSettings == IptEnableCycPackets) ?
+				L"CYC Packets" : L"No  Packets",
+				traceHeader->MtcFrequency,
+				traceHeader->FrequencyToTscRatio);
+
+			//
+			// Move to the next trace header
+			//
+			traceHeader = (PIPT_TRACE_HEADER)(traceHeader->Trace +
+				traceHeader->TraceSize);
+		}
+
+		wchar_t *traceFilePath = L"intelpt_trace.bin";
+		hIptTraceFile = CreateFileW(traceFilePath,
+			FILE_GENERIC_WRITE,
+			FILE_SHARE_READ,
+			NULL,
+			CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL,
+			NULL);
+		if (hIptTraceFile == INVALID_HANDLE_VALUE)
+		{
+			wprintf(L"[-] Unable to create trace file %s (err=%d)\n",
+				traceFilePath,
+				GetLastError());
+			goto Cleanup;
+		}
+		//
+		// Write it to disk
+		//
+		bRes = WriteFile(hIptTraceFile,
+			pIptTraceData->TraceData,
+			dwTraceSize -
+			FIELD_OFFSET(IPT_TRACE_DATA, TraceData),
+			NULL,
+			NULL);
+		if (bRes == FALSE)
+		{
+			fwprintf(stderr, L"[-] Failed to write trace to disk (err=%d)\n",
+				GetLastError());
+			goto Cleanup;
+		}
+
+		//
+		// Print out the status
+		//
+		fwprintf(stderr, L"[+] Trace for PID %d written to %s\n",
+			GetProcessId(hProcess),
+			traceFilePath);
+		dwResult = 0;
+		break;
+	}
+
+	DEFAULT_UNREACHABLE;
+	}
+
+Cleanup:
+	//
+	// Cleanup trace data if any was left over
+	//
+	if (pIptTraceData != NULL)
+	{
+		HeapFree(GetProcessHeap(), 0, pIptTraceData);
+	}
+
+	//
+	// Close the trace file if we had one
+	//
+	if (hIptTraceFile != INVALID_HANDLE_VALUE)
+	{
+		CloseHandle(hIptTraceFile);
+	}
+
+	if (hProcess != INVALID_HANDLE_VALUE)
+	{
+		//CloseHandle(hProcess);
+	}
+}
+////////////////
+
+
 static u8 run_target_intelpt(char** argv) {
   int ret = FAULT_NONE;
-  //printf("run_target_intelpt\n");
-#if 0
+  printf("run_target_intelpt\n");
+
+#if 0 // not swallowing output while debugging
   sinkhole_stds = 0;
   if (sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
 	  devnul_handle = CreateFile(
@@ -3321,18 +3690,24 @@ static u8 run_target_intelpt(char** argv) {
 	  }
   }
 #endif
-  //if (!is_child_running()) {
-	  //destroy_target_process_intelpt(0);
-	  create_target_process_intelpt(argv);
-  //}
+
+  create_target_process_intelpt(argv);
   child_timed_out = 0;
   memset(trace_bits, 0, MAP_SIZE);
   //watchdog_timeout_time = get_cur_time() + exec_tmout;
   //watchdog_enabled = 1;
 
-#ifdef PROCESS_DEBUG
+#if PROCESS_DEBUG
   DEBUG_EVENT event;
   BOOL debugging = TRUE;
+  
+
+  if (!isTracing)
+  {
+	  intelpt_trace_ctl(IptTlStartTrace);
+	  isTracing = TRUE;
+  }
+
   while (debugging)
   {	  
 	  if (!WaitForDebugEvent(&event, INFINITE))
@@ -3340,24 +3715,57 @@ static u8 run_target_intelpt(char** argv) {
   
 	  switch (event.dwDebugEventCode)
 	  {
+	  case CREATE_PROCESS_DEBUG_EVENT:
+		  HANDLE hProcess = event.u.CreateProcessInfo.hProcess;
+		  HANDLE hThread = event.u.CreateProcessInfo.hThread;
+		  printf("PROCESS CREATED pid: %d hProcess: %x tid: %d hThread: %x\n", event.dwProcessId, hProcess, GetThreadId(hThread),hThread);
+		  
+		  if (!isTracing)
+		  {
+			  intelpt_trace_ctl(IptTlStartTrace);
+			  isTracing = TRUE;
+		  }
+		  break;
+
+	  case CREATE_THREAD_DEBUG_EVENT:
+		  //printf("THREAD CREATED pid: %d tid: %d hthreaD: %x\n", event.dwProcessId, event.dwThreadId, event.u.CreateThread.hThread);
+		  break;
+
 	  case EXCEPTION_DEBUG_EVENT:
+		  //printf("EXCEPTION: pid: %d tid: %d code: %x\n", event.dwProcessId, event.dwThreadId, event.u.Exception.ExceptionRecord.ExceptionCode);
+
 		  if (event.u.Exception.dwFirstChance) break;
+
 		  ret = FAULT_CRASH;
 		  debugging = FALSE;
 		  break;
 	  case EXIT_PROCESS_DEBUG_EVENT:
+		  printf("EXIT PROCESS: pid: %d tid: %d code: %x\n", event.dwProcessId, event.dwThreadId, event.u.ExitProcess.dwExitCode);
+
 		  ret = FAULT_NONE;
 		  debugging = FALSE;
-		  if(event.u.ExitProcess.dwExitCode != 0) printf("Process exited with code : 0x%x", event.u.ExitProcess.dwExitCode);
-		  break;
+
+		  if(event.u.ExitProcess.dwExitCode != 0) printf("Process exited with code : 0x%x\n", event.u.ExitProcess.dwExitCode);
+          //intelpt_trace_ctl(IptTlGetTrace);
+	      intelpt_trace_ctl(IptTlStopTrace);
+	      break;
 	  }
+
 	  ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
   }
 #else
   DWORD exitCode = 0;
-  ResumeThread(child_thread_handle);
+  BOOL isTracing = FALSE;
+
+  
+  printf("resume %d\n", ResumeThread(child_thread_handle));
+  intelpt_trace_ctl(IptTlStartTrace);
   WaitForSingleObject(child_handle, INFINITE);
+
   GetExitCodeProcess(child_handle, &exitCode);
+  
+  //intelpt_trace_ctl(IptTlGetTrace);
+  intelpt_trace_ctl(IptTlStopTrace);
 #endif
 
   CloseHandle(child_thread_handle);
@@ -8757,25 +9165,18 @@ int main(int argc, char** argv) {
   else*/ 
   if (intelpt_mode > 0)
   {
-	// FIXME winipt
-
-	//
-	// Setup cleanup path
-	//
-	  hTraceFile = INVALID_HANDLE_VALUE;
-	  hProcess = NULL;
-	  pTraceData = NULL;
-	  dwResult = 0xFFFFFFFF;
-	  options.AsULonglong = 0;
-
+	  BOOL bRes;
+	  
 	  //
 	  // Initialize options for Intel PT Trace
 	  //
-	  options.OptionVersion = 1;
+	  ipt_options.OptionVersion = 1;
+	  ipt_options.AsULonglong = 0;
+
 	  //
 	  // Configure the buffer size
 	  //
-	  BOOL bRes = ConfigureBufferSize(L"65536", &options);
+	  bRes = ConfigureBufferSize(L"65536", &ipt_options);
 	  if (bRes == FALSE)
 	  {
 		  goto intelpt_cleanup;
@@ -8784,14 +9185,12 @@ int main(int argc, char** argv) {
 	  //
 	  // Configure the trace flag
 	  //
-	  bRes = ConfigureTraceFlags("0", &options);
+	  bRes = ConfigureTraceFlags(L"0", &ipt_options);
 	  if (bRes == FALSE)
 	  {
 		  goto intelpt_cleanup;
 	  }
 
-	  dwAction = IptTlStopTrace;
-	  printf("test\n");
 	  //
 	  // Enable and validate IPT support works
 	  //
@@ -8801,50 +9200,7 @@ int main(int argc, char** argv) {
 		  goto intelpt_cleanup;
 	  }
 
-  intelpt_cleanup:
-	  if (bRes == FALSE)
-	  {
-		  if (pTraceData != NULL)
-		  {
-			  HeapFree(GetProcessHeap(), 0, pTraceData);
-		  }
-
-		  //
-		  // Close the trace file if we had one
-		  //
-		  if (hTraceFile != INVALID_HANDLE_VALUE)
-		  {
-			  CloseHandle(hTraceFile);
-		  }
-
-		  //
-		  // Close the process handle if we had one
-		  //
-		  if (hProcess != NULL)
-		  {
-			  CloseHandle(hProcess);
-		  }
-
-		  FATAL("Error initializing Intel PT\n");
-	  }
-	  
-	  /*
-    if (!ptcov_init())
-      FATAL("ERROR: could not initialize ptcov library (check driver install)\n");
-
-    PtCovConfig ptcov_options;
-    memset(&ptcov_options, 0, sizeof(PtCovConfig));
-    ptcov_options.cpu_number = 0;
-    ptcov_options.trace_buffer_size = 64 * 1024 * 1024;
-    ptcov_options.trace_mode = MODULE;
-    ptcov_options.cov_map = &trace_bits;
-    ptcov_options.cov_map_size = MAP_SIZE;
-    ptcov_options.ptdump_path = "ptdump.bin";
-
-    if (!ptcov_init_trace(&ptcov_options, &ptcov))
-      FATAL("ERROR: could not initialize ptcov trace\n");
-	*/
-  }
+	  printf("IntelPT Driver Initialized!\n");
 #endif
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
@@ -8980,6 +9336,36 @@ int main(int argc, char** argv) {
   save_auto();
 
 stop_fuzzing:
+
+#ifdef INTELPT
+intelpt_cleanup:
+  if (bRes == FALSE)
+  {
+	  if (pIptTraceData != NULL)
+	  {
+		  HeapFree(GetProcessHeap(), 0, pIptTraceData);
+	  }
+
+	  //
+	  // Close the trace file if we had one
+	  //
+	  if (hIptTraceFile != INVALID_HANDLE_VALUE)
+	  {
+		  CloseHandle(hIptTraceFile);
+	  }
+
+	  //
+	  // Close the process handle if we had one
+	  //
+	  if (child_handle != NULL)
+	  {
+		  CloseHandle(child_handle);
+	  }
+
+  }
+
+  }
+#endif
 
   SAYF(CURSOR_SHOW cLRD "\n\n+++ Testing %s +++\n" cRST,
        stop_soon == 2 ? "ended via AFL_EXIT_WHEN_DONE" : "aborted by user");
